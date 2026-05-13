@@ -1,0 +1,13 @@
+Scan Commands Cheat Sheet
+Scan a specific index:
+
+# Quick scan — only 50 stocks (~3 min) node screener.mjs --index "NIFTY 50" # Midcap stocks node screener.mjs --index "NIFTY MIDCAP 150" # Smallcap stocks node screener.mjs --index "NIFTY SMALLCAP 250" # Full Nifty 500 — comprehensive but slow (~20 min) node screener.mjs --index "NIFTY 500"
+Scan specific stocks only:
+
+node screener.mjs --symbols RELIANCE,TCS,INFY,TATAMOTORS
+Fast mode (skip option chain analysis):
+
+# Roughly 40% faster — uses 10 signals instead of 11 node screener.mjs --no-oi # Combine flags node screener.mjs --index "NIFTY 50" --no-oi
+Or use the shortcut commands:
+
+npm run scan # NIFTY 200 (default) npm run scan:fast # NIFTY 200 without OI npm run scan:nifty50 # Nifty 50 only npm run scan:midcap # Midcap 150 npm run scan:smallcap # Smallcap 250
