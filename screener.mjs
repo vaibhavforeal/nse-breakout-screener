@@ -24,6 +24,15 @@
  *   9.  Option Chain OI Overlay    — smart money positioning (F&O only)
  *   10. Delivery % Spike           — institutional accumulation footprint
  *   11. Relative Strength vs Nifty — outperforming the benchmark
+ *   12. Block Deal Clustering      — repeated bulk deals = institutional activity
+ *
+ * Plus Market Context Gate:
+ *   - India VIX level (low/moderate/high)
+ *   - Nifty 50 vs 200 EMA (bullish/bearish trend)
+ *
+ * Plus Trade Plan for each candidate:
+ *   - Entry, Stop-Loss (ATR/swing/EMA), Take-Profit (1.5R/2.5R/4R)
+ *   - Position sizing based on % risk of capital
  *
  * Usage:
  *   node screener.mjs                              # Scan Nifty 200
@@ -39,6 +48,7 @@ import {
   ADX,
   EMA,
   SMA,
+  ATR,
 } from "technicalindicators";
 import { writeFileSync } from "fs";
 
@@ -96,23 +106,66 @@ const CONFIG = {
   deliveryPctHighBar: 65,        // Above this = strong institutional accumulation
 
   // ── Relative Strength vs Nifty 50 ──
-  rsLookbackDays: 30,            // Compare RS ratio now vs N days ago (aligned with Nifty 30d change)
+  rsLookbackDays: 20,            // Compare RS ratio now vs N days ago
   rsMinOutperformance: 2,        // Stock must outperform Nifty by at least X% over lookback
+
+  // ── ATR (for trade plan calculations) ──
+  atrPeriod: 14,
+
+  // ── Trade Plan ──
+  // How entry, stop-loss, and take-profit levels are computed
+  tradePlan: {
+    // Entry: triggered when price closes above the N-day consolidation high
+    entryBufferPct: 0.2,          // Add 0.2% above consolidation high as entry trigger
+
+    // Stop-Loss methods — picks the tightest sensible stop
+    slMethod: "atr",              // "atr" | "swing" | "ema"
+    slAtrMultiplier: 1.5,         // SL = entry - (ATR × multiplier)
+    slSwingLookback: 10,          // Look back N days for swing low
+    slMaxPct: 5,                  // Never risk more than 5% on a single trade
+
+    // Take-Profit: based on risk-reward ratios
+    tpRatios: [1.5, 2.5, 4],     // TP1 = 1.5R, TP2 = 2.5R, TP3 = 4R
+    // R = distance from entry to stop-loss (your risk per share)
+
+    // Trailing stop guidance
+    trailAfterTP1: true,          // After TP1 hit, trail SL to breakeven
+  },
+
+  // ── Market Context Gate (NEW) ──
+  // Filters the entire scan based on broader market health
+  marketContext: {
+    enabled: true,                // Set false to skip context check
+    vixLowThreshold: 14,          // VIX below this = ideal breakout environment
+    vixHighThreshold: 20,         // VIX above this = elevated fear, breakouts risky
+    niftyEmaPeriod: 200,          // EMA period for Nifty trend check
+    niftyProxySymbol: "NIFTYBEES", // ETF that tracks Nifty 50 (for historical EMA)
+    blockScanOnBearish: false,    // If true, refuse to scan in bearish conditions (use --force to override)
+  },
+
+  // ── Block Deal Clustering (Signal 12) ──
+  blockDeals: {
+    enabled: true,                // Set false to skip bulk deal fetch
+    lookbackDays: 15,             // Calendar days to look back (~10 trading days)
+    minDealsForSignal: 2,         // Minimum deals to fire signal
+    minDealsForStrong: 3,         // Minimum deals for "strong" label
+  },
 
   // ── Scoring Weights ──
   // Core signals (always active): sum to base weight pool
   // OI signal: only for F&O stocks; excluded from denominator for non-F&O
   weights: {
-    bbSqueeze:       18,
+    bbSqueeze:       16,
     volumeSurge:     12,
-    volumeRising:     8,
-    rsiStrength:      8,
+    volumeRising:     7,
+    rsiStrength:      7,
     adxTrending:     12,
     near52wHigh:     12,
-    emaAlignment:     8,
-    consolidation:    4,
+    emaAlignment:     7,
+    consolidation:    3,
     deliveryPct:     10,    // Signal 10: institutional accumulation
-    relStrength:      8,    // Signal 11: outperforming Nifty 50
+    relStrength:      7,    // Signal 11: outperforming Nifty 50
+    blockDeals:       7,    // Signal 12: institutional block deal clustering
     oiSignal:        10,    // Signal 9:  F&O only; excluded for non-F&O
   },
 
@@ -150,7 +203,7 @@ function sleep(ms) {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const result = { index: null, symbols: null, noOi: false };
+  const result = { index: null, symbols: null, noOi: false, force: false };
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--index" && args[i + 1]) {
@@ -161,6 +214,8 @@ function parseArgs() {
       i++;
     } else if (args[i] === "--no-oi") {
       result.noOi = true;
+    } else if (args[i] === "--force") {
+      result.force = true;
     }
   }
 
@@ -246,7 +301,7 @@ async function fetchHistoricalData(symbol) {
     }
 
     // Sort by date ascending (oldest first) for indicator calculation
-    // Accept EQ/BE series or rows where chSeries is missing
+    // Accept EQ/BE series, or rows where chSeries is missing
     const sorted = allData
       .filter((d) => !d.chSeries || d.chSeries === "EQ" || d.chSeries === "BE")
       .sort(
@@ -519,6 +574,179 @@ async function fetchTradeInfo(symbol) {
   }
 }
 
+
+// ──────────────────────────────────────────────────────────────
+// STEP 2e: Fetch Market Context (India VIX + Nifty 200 EMA)
+// ──────────────────────────────────────────────────────────────
+
+async function fetchMarketContext() {
+  /**
+   * Fetches broader market health indicators to gate the entire scan.
+   *
+   * Two checks:
+   *   A) India VIX level — fear gauge
+   *      - Below 14: ideal breakout environment
+   *      - 14-20: moderate, breakouts possible
+   *      - Above 20: elevated fear, breakouts often fail
+   *
+   *   B) Nifty 50 vs 200 EMA — trend health
+   *      - Above 200 EMA: bullish trend, breakouts have tailwind
+   *      - Below 200 EMA: bearish trend, breakouts have headwind
+   *
+   * Uses NIFTYBEES ETF (tracks Nifty 50 with 99%+ correlation) as
+   * proxy for historical EMA calculation since direct index history
+   * requires a different API endpoint.
+   */
+  console.log("  📡 Fetching market context (VIX + Nifty 200 EMA)...");
+
+  const context = {
+    vix: null,
+    vixLevel: "unknown",
+    niftyPrice: null,
+    nifty200EMA: null,
+    niftyAbove200EMA: null,
+    marketCondition: "unknown",
+    allowScan: true,
+  };
+
+  // ── A) Fetch India VIX ──
+  try {
+    const allIndices = await nse.getAllIndices();
+
+    if (allIndices && allIndices.data) {
+      const vixEntry = allIndices.data.find(
+        (idx) =>
+          idx.index === "INDIA VIX" ||
+          idx.indexSymbol === "INDIA VIX" ||
+          idx.symbol === "INDIA VIX"
+      );
+
+      if (vixEntry) {
+        context.vix = vixEntry.last || vixEntry.lastPrice;
+        const c = CONFIG.marketContext;
+        if (context.vix <= c.vixLowThreshold) context.vixLevel = "low";
+        else if (context.vix >= c.vixHighThreshold) context.vixLevel = "high";
+        else context.vixLevel = "moderate";
+      }
+    }
+  } catch (err) {
+    console.log(`  ⚠️  VIX fetch failed: ${err.message}`);
+  }
+
+  // ── B) Fetch NIFTYBEES historical for 200 EMA proxy ──
+  try {
+    await sleep(800);
+    const niftyHistoryData = await fetchHistoricalData(
+      CONFIG.marketContext.niftyProxySymbol
+    );
+
+    if (niftyHistoryData && niftyHistoryData.length >= CONFIG.marketContext.niftyEmaPeriod) {
+      const closes = niftyHistoryData.map((d) => d.chClosingPrice);
+      const ema200Array = EMA.calculate({
+        values: closes,
+        period: CONFIG.marketContext.niftyEmaPeriod,
+      });
+
+      context.niftyPrice = closes[closes.length - 1];
+      context.nifty200EMA = ema200Array[ema200Array.length - 1];
+      context.niftyAbove200EMA = context.niftyPrice > context.nifty200EMA;
+    }
+  } catch (err) {
+    console.log(`  ⚠️  Nifty EMA fetch failed: ${err.message}`);
+  }
+
+  // ── Determine overall market condition ──
+  const vixOk = context.vixLevel === "low" || context.vixLevel === "moderate";
+  const trendOk = context.niftyAbove200EMA === true;
+
+  if (vixOk && trendOk) {
+    context.marketCondition = "bullish";
+  } else if (!vixOk && !trendOk) {
+    context.marketCondition = "bearish";
+    context.allowScan = !CONFIG.marketContext.blockScanOnBearish;
+  } else if (context.vixLevel === "unknown" || context.niftyAbove200EMA === null) {
+    context.marketCondition = "unknown";
+  } else {
+    context.marketCondition = "neutral";
+  }
+
+  // ── Display traffic-light status ──
+  const lightEmoji = {
+    bullish: "🟢",
+    neutral: "🟡",
+    bearish: "🔴",
+    unknown: "⚪",
+  };
+
+  console.log(`  ${lightEmoji[context.marketCondition]} Market: ${context.marketCondition.toUpperCase()}`);
+  if (context.vix != null) {
+    console.log(`     India VIX: ${context.vix.toFixed(2)} (${context.vixLevel})`);
+  }
+  if (context.niftyAbove200EMA !== null) {
+    const direction = context.niftyAbove200EMA ? "above" : "below";
+    console.log(
+      `     Nifty: ${context.niftyPrice.toFixed(0)} ${direction} 200 EMA (${context.nifty200EMA.toFixed(0)})`
+    );
+  }
+  console.log();
+
+  return context;
+}
+
+
+// ──────────────────────────────────────────────────────────────
+// STEP 2f: Fetch Bulk/Block Deal history for Signal 12
+// ──────────────────────────────────────────────────────────────
+
+async function fetchBulkDealHistory() {
+  /**
+   * Fetches NSE's historical bulk deals for the last N days.
+   * Returns a Map<symbol, count> showing how many bulk deals
+   * each stock has had in the lookback window.
+   *
+   * Bulk deals (>0.5% of total shares in one transaction) are
+   * a strong institutional accumulation signal when clustered.
+   *
+   * NSE endpoint: /api/historical/cm/bulk_deals?from=DD-MM-YYYY&to=DD-MM-YYYY
+   */
+  if (!CONFIG.blockDeals.enabled) {
+    return new Map();
+  }
+
+  console.log(`  📡 Fetching bulk deal history (last ${CONFIG.blockDeals.lookbackDays} days)...`);
+
+  const dealMap = new Map();
+
+  try {
+    const today = new Date();
+    const fromDate = new Date(today);
+    fromDate.setDate(fromDate.getDate() - CONFIG.blockDeals.lookbackDays);
+
+    const formatDate = (d) =>
+      `${String(d.getDate()).padStart(2, "0")}-${String(d.getMonth() + 1).padStart(2, "0")}-${d.getFullYear()}`;
+
+    const endpoint = `/api/historical/cm/bulk_deals?from=${formatDate(fromDate)}&to=${formatDate(today)}`;
+
+    const result = await nse.getDataByEndpoint(endpoint);
+
+    if (result && result.data && Array.isArray(result.data)) {
+      for (const deal of result.data) {
+        const symbol = deal.symbol || deal.BD_SYMBOL || deal.SYMBOL;
+        if (symbol) {
+          dealMap.set(symbol, (dealMap.get(symbol) || 0) + 1);
+        }
+      }
+    }
+
+    console.log(`  ✅ Found bulk deals across ${dealMap.size} unique stocks\n`);
+  } catch (err) {
+    console.log(`  ⚠️  Bulk deal fetch failed: ${err.message}. Signal 12 will be skipped.\n`);
+  }
+
+  return dealMap;
+}
+
+
 function computeIndicators(data) {
   /**
    * Extract OHLCV arrays from NSE historical data,
@@ -561,6 +789,14 @@ function computeIndicators(data) {
   // ── Volume SMA ──
   const volSma20 = SMA.calculate({ values: volume, period: 20 });
 
+  // ── ATR (Average True Range) — for trade plan stop-loss ──
+  const atr = ATR.calculate({
+    close,
+    high,
+    low,
+    period: CONFIG.atrPeriod,
+  });
+
   return {
     close,
     high,
@@ -574,6 +810,126 @@ function computeIndicators(data) {
     emaMedium,
     emaLong,
     volSma20,
+    atr,
+  };
+}
+
+
+// ──────────────────────────────────────────────────────────────
+// TRADE PLAN: Compute entry, stop-loss, and take-profit levels
+// ──────────────────────────────────────────────────────────────
+
+function computeTradePlan(data, ind) {
+  /**
+   * Generates actionable trade levels for each breakout candidate.
+   *
+   * Entry:
+   *   The consolidation high (recent N-day high) + a small buffer.
+   *   This is where you place a buy order or watch for a close above.
+   *
+   * Stop-Loss (3 methods, configurable):
+   *   - ATR-based:  Entry - (ATR × multiplier). Adapts to volatility.
+   *   - Swing low:  Recent N-day low. Below the consolidation floor.
+   *   - EMA-based:  Below the nearest supporting EMA (20 or 50).
+   *
+   * Take-Profit (risk-reward based):
+   *   TP1 = Entry + (risk × 1.5)  — partial exit, move SL to breakeven
+   *   TP2 = Entry + (risk × 2.5)  — primary target
+   *   TP3 = Entry + (risk × 4.0)  — runner / trend continuation target
+   *
+   * Returns: { entry, stopLoss, risk, riskPct, tp1, tp2, tp3, rrDescription }
+   */
+  const tp = CONFIG.tradePlan;
+  const n = CONFIG.consolidationDays;
+  const close = ind.close;
+  const currentPrice = close[close.length - 1];
+
+  // ── Entry: consolidation high + buffer ──
+  const recentHigh = Math.max(...ind.high.slice(-n));
+  const entryBuffer = recentHigh * (tp.entryBufferPct / 100);
+  const entry = Math.round((recentHigh + entryBuffer) * 100) / 100;
+
+  // ── Stop-Loss ──
+  let stopLoss;
+  let slLabel;
+
+  if (tp.slMethod === "atr" && ind.atr.length > 0) {
+    // ATR-based: entry minus ATR × multiplier
+    const currentATR = ind.atr[ind.atr.length - 1];
+    stopLoss = entry - (currentATR * tp.slAtrMultiplier);
+    slLabel = `ATR(${CONFIG.atrPeriod}) × ${tp.slAtrMultiplier}`;
+
+  } else if (tp.slMethod === "ema") {
+    // EMA-based: below the nearest supporting EMA
+    const ema20 = ind.emaShort.length > 0 ? ind.emaShort[ind.emaShort.length - 1] : null;
+    const ema50 = ind.emaMedium.length > 0 ? ind.emaMedium[ind.emaMedium.length - 1] : null;
+    // Use the higher EMA that's still below entry (tighter stop)
+    if (ema20 && ema20 < entry) {
+      stopLoss = ema20 * 0.995; // Just below EMA20
+      slLabel = "Below EMA20";
+    } else if (ema50 && ema50 < entry) {
+      stopLoss = ema50 * 0.995;
+      slLabel = "Below EMA50";
+    } else {
+      // Fallback to swing low
+      stopLoss = Math.min(...ind.low.slice(-tp.slSwingLookback));
+      slLabel = `${tp.slSwingLookback}d swing low`;
+    }
+
+  } else {
+    // Swing low: recent N-day low
+    stopLoss = Math.min(...ind.low.slice(-tp.slSwingLookback));
+    slLabel = `${tp.slSwingLookback}d swing low`;
+  }
+
+  stopLoss = Math.round(stopLoss * 100) / 100;
+
+  // ── Sanity check: cap max risk ──
+  const riskPct = ((entry - stopLoss) / entry) * 100;
+  if (riskPct > tp.slMaxPct) {
+    // If risk exceeds max %, tighten the stop
+    stopLoss = Math.round(entry * (1 - tp.slMaxPct / 100) * 100) / 100;
+    slLabel += ` (capped at ${tp.slMaxPct}%)`;
+  }
+
+  // ── Risk per share ──
+  const risk = Math.round((entry - stopLoss) * 100) / 100;
+  const finalRiskPct = Math.round(((risk / entry) * 100) * 10) / 10;
+
+  // ── Take-Profit levels (R-multiple based) ──
+  const targets = tp.tpRatios.map((ratio) => ({
+    label: `TP${tp.tpRatios.indexOf(ratio) + 1} (${ratio}R)`,
+    price: Math.round((entry + risk * ratio) * 100) / 100,
+    pctFromEntry: Math.round((risk * ratio / entry) * 100 * 10) / 10,
+  }));
+
+  // ── Position sizing suggestion ──
+  // Based on risking 1% of capital
+  const capitalExample = 100000; // ₹1,00,000 as example
+  const riskAmount = capitalExample * 0.01; // 1% of capital
+  const shares = risk > 0 ? Math.floor(riskAmount / risk) : 0;
+
+  return {
+    entry,
+    stopLoss,
+    slLabel,
+    risk,
+    riskPct: finalRiskPct,
+    targets,
+    tp1: targets[0]?.price || null,
+    tp2: targets[1]?.price || null,
+    tp3: targets[2]?.price || null,
+    currentPrice,
+    distanceToEntry: Math.round(((entry - currentPrice) / currentPrice) * 100 * 10) / 10,
+    positionSizing: {
+      capitalExample,
+      riskPercent: 1,
+      shares,
+      investmentAmount: shares * entry,
+      maxLoss: shares * risk,
+    },
+    // ATR value for reference
+    atr: ind.atr.length > 0 ? Math.round(ind.atr[ind.atr.length - 1] * 100) / 100 : null,
   };
 }
 
@@ -806,24 +1162,68 @@ function checkRelativeStrength(stockData, niftyData) {
 
 
 // ──────────────────────────────────────────────────────────────
+// SIGNAL 12: Block Deal Clustering — institutional fingerprint
+// ──────────────────────────────────────────────────────────────
+
+function checkBlockDealClustering(symbol, bulkDealMap) {
+  /**
+   * Counts how many bulk deals (>0.5% of total shares in one trade)
+   * have occurred for this symbol in the lookback window.
+   *
+   * Clustering = multiple deals in short window = institutions
+   * are repeatedly transacting in this stock = strong accumulation.
+   *
+   *   2+ deals → signal fires
+   *   3+ deals → "strong" label
+   */
+  if (!bulkDealMap || bulkDealMap.size === 0) {
+    return { hit: false, detail: "No bulk deal data" };
+  }
+
+  const dealCount = bulkDealMap.get(symbol) || 0;
+  const config = CONFIG.blockDeals;
+
+  const isHit = dealCount >= config.minDealsForSignal;
+  const isStrong = dealCount >= config.minDealsForStrong;
+
+  let label;
+  if (dealCount === 0) {
+    label = "No bulk deals";
+  } else if (isStrong) {
+    label = `${dealCount} bulk deals (strong cluster)`;
+  } else if (isHit) {
+    label = `${dealCount} bulk deals (cluster forming)`;
+  } else {
+    label = `${dealCount} bulk deal (isolated)`;
+  }
+
+  return {
+    hit: isHit,
+    detail: `${label} in last ${config.lookbackDays}d`,
+  };
+}
+
+
+// ──────────────────────────────────────────────────────────────
 // STEP 5: Score a stock — combine all signals
 // ──────────────────────────────────────────────────────────────
 
-function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData) {
+function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData, bulkDealMap) {
   /**
-   * @param oiResult  — from analyzeOI(), or null for non-F&O stocks.
-   * @param tradeInfo — from fetchTradeInfo(), has delivery % data.
-   * @param niftyData — Nifty 50 benchmark data for RS calculation.
+   * @param oiResult    — from analyzeOI(), or null for non-F&O stocks.
+   * @param tradeInfo   — from fetchTradeInfo(), has delivery % data.
+   * @param niftyData   — Nifty 50 benchmark data for RS calculation.
+   * @param bulkDealMap — Map<symbol, count> of bulk deals (Signal 12).
    *
    * OI weight excluded from denominator for non-F&O stocks.
-   * Delivery % and RS always apply.
+   * All other signals always apply.
    */
   const latest = data[data.length - 1];
   const close = latest.chClosingPrice;
   const avgVol =
     ind.volSma20.length > 0 ? ind.volSma20[ind.volSma20.length - 1] : 0;
 
-  // Run all 10 core signal checks (always active)
+  // Run all 11 core signal checks (always active)
   const checks = {
     bbSqueeze: checkBBSqueeze(ind),
     volumeSurge: checkVolumeSurge(ind),
@@ -835,6 +1235,7 @@ function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData) {
     consolidation: checkConsolidation(ind),
     deliveryPct: checkDeliveryPct(tradeInfo),
     relStrength: checkRelativeStrength(data, niftyData),
+    blockDeals: checkBlockDealClustering(symbol, bulkDealMap),
   };
 
   // Add OI signal if available (F&O stocks only)
@@ -879,6 +1280,9 @@ function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData) {
       ? ((latest.ch52WeekHighPrice - close) / latest.ch52WeekHighPrice) * 100
       : 0;
 
+  // Compute trade plan (entry, SL, TP levels)
+  const tradePlan = computeTradePlan(data, ind);
+
   return {
     symbol,
     price: Math.round(close * 100) / 100,
@@ -895,6 +1299,7 @@ function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData) {
     deliveryPct: tradeInfo?.securityWiseDP?.deliveryToTradedQuantity ?? null,
     isFnO,
     oiMetrics: isFnO && oiResult.metrics ? oiResult.metrics : null,
+    tradePlan,
     details: signalDetails,
   };
 }
@@ -904,7 +1309,7 @@ function scoreStock(symbol, data, ind, oiResult, tradeInfo, niftyData) {
 // STEP 6: Analyze one stock end-to-end
 // ──────────────────────────────────────────────────────────────
 
-async function analyzeStock(symbol, niftyData) {
+async function analyzeStock(symbol, niftyData, bulkDealMap) {
   // 1. Fetch historical data
   const data = await fetchHistoricalData(symbol);
   if (!data) return null;
@@ -935,8 +1340,8 @@ async function analyzeStock(symbol, niftyData) {
     }
   }
 
-  // 6. Score with all 11 signals
-  return scoreStock(symbol, data, indicators, oiResult, tradeInfo, niftyData);
+  // 6. Score with all 12 signals
+  return scoreStock(symbol, data, indicators, oiResult, tradeInfo, niftyData, bulkDealMap);
 }
 
 
@@ -954,15 +1359,45 @@ async function main() {
 
   console.log();
   console.log("═".repeat(70));
-  console.log("  🔍 NSE BREAKOUT SCREENER v2.2 (11 signals)");
+  console.log("  🔍 NSE BREAKOUT SCREENER v2.3 (12 signals + market gate)");
   console.log(`  📅 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`);
   console.log("  📡 Data source: NSE India (direct)");
   console.log(`  🔗 OI overlay: ${CONFIG.oiEnabled ? "ON (F&O stocks)" : "OFF (--no-oi)"}`);
   console.log("═".repeat(70));
   console.log();
 
+  // ── Fetch Market Context (VIX + Nifty 200 EMA) ──
+  let marketContext = null;
+  if (CONFIG.marketContext.enabled) {
+    marketContext = await fetchMarketContext();
+    await sleep(CONFIG.delayBetweenRequests);
+
+    // Block scan if market is bearish and --force not used
+    if (marketContext.marketCondition === "bearish" && !args.force) {
+      console.log("  ⚠️  MARKET WARNING:");
+      console.log("     Conditions are BEARISH (high VIX + Nifty below 200 EMA).");
+      console.log("     Most breakouts fail in this environment.");
+      console.log();
+      console.log("     If you want to scan anyway, use: --force");
+      console.log("     To disable this gate entirely, set CONFIG.marketContext.enabled = false");
+      console.log();
+      if (CONFIG.marketContext.blockScanOnBearish) {
+        console.log("  ❌ Scan blocked. Exiting.");
+        process.exit(0);
+      } else {
+        console.log("  ℹ️  Continuing scan, but expect lower win rate.\n");
+      }
+    } else if (marketContext.marketCondition === "neutral") {
+      console.log("  ℹ️  Market is NEUTRAL — proceed with caution.\n");
+    }
+  }
+
   // ── Fetch Nifty 50 benchmark (once, for Relative Strength) ──
   const niftyData = await fetchNiftyHistorical();
+  await sleep(CONFIG.delayBetweenRequests);
+
+  // ── Fetch bulk deal history (once, for Signal 12) ──
+  const bulkDealMap = await fetchBulkDealHistory();
   await sleep(CONFIG.delayBetweenRequests);
 
   // ── Determine stock universe ──
@@ -993,7 +1428,7 @@ async function main() {
     process.stdout.write(`  ${progress} Analyzing ${symbol}...`);
 
     try {
-      const result = await analyzeStock(symbol, niftyData);
+      const result = await analyzeStock(symbol, niftyData, bulkDealMap);
 
       if (result) {
         results.push(result);
@@ -1031,9 +1466,9 @@ async function main() {
   console.log("═".repeat(75));
   console.log();
   console.log(
-    `  ${"#".padEnd(4)} ${"SYMBOL".padEnd(15)} ${"PRICE".padStart(10)} ${"SCORE".padStart(7)} ${"SIGNALS".padStart(9)} ${"RSI".padStart(6)} ${"ADX".padStart(6)} ${"52W%".padStart(6)} ${"DEL%".padStart(6)} ${"OI".padStart(5)}`
+    `  ${"#".padEnd(4)} ${"SYMBOL".padEnd(15)} ${"PRICE".padStart(8)} ${"SCORE".padStart(7)} ${"SIGNALS".padStart(9)} ${"RSI".padStart(6)} ${"ADX".padStart(6)} ${"52W%".padStart(6)} ${"DEL%".padStart(6)} ${"OI".padStart(5)}`
   );
-  console.log("  " + "─".repeat(76));
+  console.log("  " + "─".repeat(72));
 
   for (let i = 0; i < topN; i++) {
     const r = results[i];
@@ -1047,7 +1482,7 @@ async function main() {
       : "—";
     console.log(
       `  ${String(i + 1).padEnd(4)} ${r.symbol.padEnd(15)} ` +
-        `₹${String(r.price.toLocaleString("en-IN")).padStart(9)} ` +
+        `₹${String(r.price.toLocaleString("en-IN")).padStart(7)} ` +
         `${String(r.score + "%").padStart(6)} ` +
         `${String(r.signalsHit + "/" + r.totalSignals).padStart(7)} ` +
         `${String(r.rsi).padStart(6)} ` +
@@ -1065,6 +1500,7 @@ async function main() {
   console.log("═".repeat(75));
 
   for (const r of results.slice(0, 5)) {
+    const tp = r.tradePlan;
     console.log();
     const fnoLabel = r.isFnO ? " 🔗 F&O" : "";
     console.log(
@@ -1077,13 +1513,69 @@ async function main() {
     console.log(`  │  Avg Volume: ${r.avgVolume.toLocaleString("en-IN")}${delLabel}`);
     if (r.isFnO && r.oiMetrics) {
       console.log(
-        `  │  OI Metrics: ATM Strike: ₹${r.oiMetrics.atmStrike} | PCR: ${r.oiMetrics.pcr.toFixed(2)} | Call OI Δ: ${r.oiMetrics.callOIChangePct >= 0 ? "+" : ""}${r.oiMetrics.callOIChangePct.toFixed(1)}% | Put OI Δ: ${r.oiMetrics.putOIChangePct >= 0 ? "+" : ""}${r.oiMetrics.putOIChangePct.toFixed(1)}%`
+        `  │  OI Metrics: ATM ₹${r.oiMetrics.atmStrike} | PCR: ${r.oiMetrics.pcr.toFixed(2)} | Call OI Δ: ${r.oiMetrics.callOIChangePct >= 0 ? "+" : ""}${r.oiMetrics.callOIChangePct.toFixed(1)}% | Put OI Δ: ${r.oiMetrics.putOIChangePct >= 0 ? "+" : ""}${r.oiMetrics.putOIChangePct.toFixed(1)}%`
       );
     }
+
+    // ── Trade Plan ──
+    if (tp) {
+      console.log(`  │`);
+      console.log(`  │  📐 TRADE PLAN (ATR: ₹${tp.atr || "—"})`);
+      console.log(`  │  ┌───────────────────────────────────────────────`);
+
+      // Entry
+      const entryNote = tp.distanceToEntry > 0
+        ? `${tp.distanceToEntry}% above CMP`
+        : `${Math.abs(tp.distanceToEntry)}% below CMP — already above entry`;
+      console.log(`  │  │  🟢 ENTRY:     ₹${tp.entry.toLocaleString("en-IN")}  (${entryNote})`);
+
+      // Stop-Loss
+      console.log(`  │  │  🔴 STOP-LOSS: ₹${tp.stopLoss.toLocaleString("en-IN")}  (Risk: ${tp.riskPct}% | ₹${tp.risk} per share | ${tp.slLabel})`);
+
+      // Take-Profits
+      for (const t of tp.targets) {
+        console.log(`  │  │  🎯 ${t.label.padEnd(9)}: ₹${t.price.toLocaleString("en-IN")}  (+${t.pctFromEntry}% from entry)`);
+      }
+
+      // Position sizing
+      const ps = tp.positionSizing;
+      console.log(`  │  │`);
+      console.log(`  │  │  📊 Position (₹${(ps.capitalExample/1000).toFixed(0)}K capital, ${ps.riskPercent}% risk):`);
+      console.log(`  │  │     Shares: ${ps.shares} | Investment: ₹${ps.investmentAmount.toLocaleString("en-IN")} | Max loss: ₹${ps.maxLoss.toLocaleString("en-IN")}`);
+      console.log(`  │  └───────────────────────────────────────────────`);
+    }
+
+    // Signal details
+    console.log(`  │`);
     for (const detail of r.details) {
       console.log(`  │ ${detail}`);
     }
     console.log("  └" + "─".repeat(55));
+  }
+
+  // ── Trade Plan Quick Reference: Top 25 ──
+  console.log();
+  console.log("═".repeat(75));
+  console.log("  📐 TRADE PLAN — QUICK REFERENCE (All candidates)");
+  console.log("═".repeat(75));
+  console.log();
+  console.log(
+    `  ${"SYMBOL".padEnd(15)} ${"CMP".padStart(8)} ${"ENTRY".padStart(8)} ${"SL".padStart(8)} ${"TP1".padStart(8)} ${"TP2".padStart(8)} ${"RISK%".padStart(7)}`
+  );
+  console.log("  " + "─".repeat(62));
+
+  for (const r of results.slice(0, topN)) {
+    const tp = r.tradePlan;
+    if (!tp) continue;
+    console.log(
+      `  ${r.symbol.padEnd(15)} ` +
+        `₹${String(r.price).padStart(7)} ` +
+        `₹${String(tp.entry).padStart(7)} ` +
+        `₹${String(tp.stopLoss).padStart(7)} ` +
+        `₹${String(tp.tp1 || "—").padStart(7)} ` +
+        `₹${String(tp.tp2 || "—").padStart(7)} ` +
+        `${String(tp.riskPct + "%").padStart(6)}`
+    );
   }
 
   // ── Summary ──
@@ -1091,37 +1583,71 @@ async function main() {
   const moderate = results.filter((r) => r.score >= 40 && r.score < 60);
   const fnoCount = results.filter((r) => r.isFnO).length;
   const highDelivery = results.filter((r) => r.deliveryPct != null && r.deliveryPct >= CONFIG.deliveryPctHighBar);
+  const blockDealStocks = bulkDealMap ? bulkDealMap.size : 0;
 
   console.log();
   console.log("═".repeat(75));
   console.log("  📊 SUMMARY");
   console.log("═".repeat(75));
+  if (marketContext) {
+    const lightEmoji = { bullish: "🟢", neutral: "🟡", bearish: "🔴", unknown: "⚪" };
+    console.log(`  Market context:         ${lightEmoji[marketContext.marketCondition]} ${marketContext.marketCondition.toUpperCase()}`);
+  }
   console.log(`  Stocks scanned:         ${results.length}`);
   console.log(`  F&O eligible (OI):      ${fnoCount}`);
   console.log(`  High delivery (≥${CONFIG.deliveryPctHighBar}%):  ${highDelivery.length}`);
+  console.log(`  Bulk deal stocks:       ${blockDealStocks} (across NSE in last ${CONFIG.blockDeals.lookbackDays}d)`);
   console.log(`  Strong (≥60%):          ${strong.length}`);
   console.log(`  Moderate (40-60%):      ${moderate.length}`);
   console.log(`  Failed downloads:       ${failed.length}`);
 
-  // ── Export JSON ──
-  const exportData = results.slice(0, topN).map((r) => ({
-    symbol: r.symbol,
-    price: r.price,
-    score: r.score,
-    signalsHit: r.signalsHit,
-    totalSignals: r.totalSignals,
-    rsi: r.rsi,
-    adx: r.adx,
-    pctFrom52wHigh: r.pctFrom52w,
-    high52w: r.high52w,
-    avgVolume: r.avgVolume,
-    deliveryPct: r.deliveryPct,
-    isFnO: r.isFnO,
-    oiMetrics: r.oiMetrics,
-  }));
+  // ── Export JSON (with market context wrapper) ──
+  const exportPayload = {
+    metadata: {
+      scanTime: new Date().toISOString(),
+      marketContext: marketContext ? {
+        condition: marketContext.marketCondition,
+        vix: marketContext.vix,
+        vixLevel: marketContext.vixLevel,
+        niftyPrice: marketContext.niftyPrice,
+        nifty200EMA: marketContext.nifty200EMA,
+        niftyAbove200EMA: marketContext.niftyAbove200EMA,
+      } : null,
+      totalScanned: results.length,
+      bulkDealStocksAcrossNSE: blockDealStocks,
+    },
+    candidates: results.slice(0, topN).map((r) => ({
+      symbol: r.symbol,
+      price: r.price,
+      score: r.score,
+      signalsHit: r.signalsHit,
+      totalSignals: r.totalSignals,
+      rsi: r.rsi,
+      adx: r.adx,
+      pctFrom52wHigh: r.pctFrom52w,
+      high52w: r.high52w,
+      avgVolume: r.avgVolume,
+      deliveryPct: r.deliveryPct,
+      bulkDealCount: bulkDealMap ? (bulkDealMap.get(r.symbol) || 0) : 0,
+      isFnO: r.isFnO,
+      oiMetrics: r.oiMetrics,
+      tradePlan: r.tradePlan ? {
+        entry: r.tradePlan.entry,
+        stopLoss: r.tradePlan.stopLoss,
+        riskPct: r.tradePlan.riskPct,
+        riskPerShare: r.tradePlan.risk,
+        tp1: r.tradePlan.tp1,
+        tp2: r.tradePlan.tp2,
+        tp3: r.tradePlan.tp3,
+        atr: r.tradePlan.atr,
+        distanceToEntry: r.tradePlan.distanceToEntry,
+        positionSizing: r.tradePlan.positionSizing,
+      } : null,
+    })),
+  };
 
   const outputFile = "breakout_results.json";
-  writeFileSync(outputFile, JSON.stringify(exportData, null, 2));
+  writeFileSync(outputFile, JSON.stringify(exportPayload, null, 2));
 
   console.log();
   console.log(`  💾 Results saved: ${outputFile}`);

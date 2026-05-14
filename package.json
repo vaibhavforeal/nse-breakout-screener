@@ -1,7 +1,7 @@
 {
   "name": "nse-breakout-screener",
-  "version": "2.2.0",
-  "description": "Automated NSE stock breakout screener with 11 signals — delivery %, OI overlay, relative strength",
+  "version": "2.3.0",
+  "description": "Automated NSE breakout screener with 12 signals, market context gate, and trade plan calculator",
   "type": "module",
   "main": "screener.mjs",
   "scripts": {
