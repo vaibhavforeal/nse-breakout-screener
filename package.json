@@ -12,7 +12,8 @@
     "scan:nifty50:fast": "node screener.mjs --index \"NIFTY 50\" --no-oi",
     "scan:nifty500": "node screener.mjs --index \"NIFTY 500\"",
     "scan:midcap": "node screener.mjs --index \"NIFTY MIDCAP 150\"",
-    "scan:smallcap": "node screener.mjs --index \"NIFTY SMALLCAP 250\""
+    "scan:smallcap": "node screener.mjs --index \"NIFTY SMALLCAP 250\"",
+    "dashboard": "node server.mjs"
   },
   "dependencies": {
     "stock-nse-india": "^1.3.0",

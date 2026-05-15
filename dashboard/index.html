@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NSE Breakout Screener | Institutional Grade Terminal</title>
+    <meta name="description" content="Professional trading dashboard for NSE breakout screening with 12 technical signals, market context analysis, and trade plan calculator.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="loading-spinner">
+            <div class="spinner-ring"></div>
+            <p class="loading-text">Initializing Terminal...</p>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header id="app-header" class="app-header">
+        <div class="header-inner">
+            <div class="header-left">
+                <h1 class="brand-title">NSE Breakout Screener</h1>
+                <span class="version-badge">v2.3</span>
+            </div>
+            <div class="header-right">
+                <div class="scan-info">
+                    <span class="label-caps">LAST SCAN</span>
+                    <span id="last-scan-time" class="data-md text-primary">—</span>
+                </div>
+                <span class="material-symbols-outlined text-muted">schedule</span>
+                <button id="btn-scan-fast" class="btn-secondary" title="Quick scan without OI data">
+                    FAST
+                </button>
+                <button id="btn-scan" class="btn-primary" title="Full scan with all 12 signals">
+                    <span class="material-symbols-outlined btn-icon">radar</span>
+                    RUN SCAN
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main -->
+    <main class="app-main">
+        <section id="market-context" class="section-grid"></section>
+        <section id="summary-stats" class="stats-grid"></section>
+        <div class="section-heading">
+            <span class="material-symbols-outlined filled text-primary">star</span>
+            <h2>Top Spotlight Candidates</h2>
+        </div>
+        <section id="spotlight" class="spotlight-grid"></section>
+        <section id="screening-table" class="table-section glass-card"></section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+        <div class="footer-inner">
+            <div class="footer-left">
+                <span class="brand-title-sm">NSE Breakout Screener</span>
+                <span class="text-muted body-md">© 2024 Institutional grade precision.</span>
+            </div>
+            <div class="footer-links">
+                <a href="#">Legal Disclaimer</a>
+                <a href="#">Data Sources</a>
+                <a href="#">Terms</a>
+                <a href="#">Privacy</a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- FAB -->
+    <button id="fab-top" class="fab" title="Scroll to top">
+        <span class="material-symbols-outlined filled">bolt</span>
+    </button>
+
+    <!-- Scan Sidebar -->
+    <aside id="scan-sidebar" class="scan-sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-title-group">
+                <span class="material-symbols-outlined filled text-primary">terminal</span>
+                <h3>Live Scan Feed</h3>
+            </div>
+            <div class="sidebar-controls">
+                <button id="sidebar-clear" class="sidebar-btn" title="Clear logs">
+                    <span class="material-symbols-outlined">delete_sweep</span>
+                </button>
+                <button id="sidebar-close" class="sidebar-btn" title="Close panel">
+                    <span class="material-symbols-outlined">close</span>
+                </button>
+            </div>
+        </div>
+        <div class="sidebar-status" id="sidebar-status">
+            <span class="status-dot" id="status-dot"></span>
+            <span class="status-text" id="status-text">Idle</span>
+            <span class="status-timer" id="status-timer"></span>
+        </div>
+        <div class="sidebar-logs" id="sidebar-logs">
+            <div class="log-empty">
+                <span class="material-symbols-outlined" style="font-size:40px;opacity:0.3">radar</span>
+                <p>Click <strong>RUN SCAN</strong> to fetch live NSE data.</p>
+                <p class="text-muted" style="font-size:11px">Logs will appear here in real-time.</p>
+            </div>
+        </div>
+    </aside>
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <!-- Error Toast -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>
