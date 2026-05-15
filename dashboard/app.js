@@ -99,86 +99,102 @@ function startTimer() {
 }
 function stopTimer() { clearInterval(timerInterval); }
 
+// ===== TERMINAL FEED =====
+const STOCK_RE = /\[(\d+)\/(\d+)\]\s*Analyzing\s+(\S+)\.\.\.\s*(.*)/;
+
+function resetTerminal() {
+  document.getElementById('terminal-feed').innerHTML = '';
+  document.getElementById('terminal-progress').classList.add('hidden');
+  document.getElementById('progress-fill').style.width = '0%';
+  setTerminalBadge('live');
+}
+function setTerminalBadge(state) {
+  const b = document.getElementById('terminal-badge');
+  b.className = 'terminal-badge ' + state;
+  b.textContent = state==='live'?'LIVE':state==='done'?'DONE':state==='error'?'ERROR':'IDLE';
+}
+function addTerminalEntry(text) {
+  const m = text.match(STOCK_RE);
+  if (!m) return;
+  const [,cur,tot,sym,rest] = m;
+  const c = parseInt(cur), t = parseInt(tot);
+  document.getElementById('terminal-progress').classList.remove('hidden');
+  document.getElementById('progress-fill').style.width = ((c/t)*100)+'%';
+  document.getElementById('progress-label').textContent = c+'/'+t;
+  const sm = rest.match(/Score:\s*([\d.]+)%/);
+  const skip = rest.includes('Skipped');
+  const sc = sm ? parseFloat(sm[1]) : null;
+  let dot = 'low';
+  if (skip) dot='skip'; else if (sc>=40) dot='high'; else if (sc>=20) dot='mid';
+  const feed = document.getElementById('terminal-feed');
+  const empty = feed.querySelector('.terminal-empty');
+  if (empty) empty.remove();
+  const el = document.createElement('div');
+  el.className = 'feed-entry';
+  const now = new Date();
+  const ts = now.getHours()+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0');
+  el.innerHTML = '<span class="feed-dot '+dot+'"></span>'
+    +'<span class="feed-symbol">'+sym+'</span>'
+    +'<span class="feed-score" style="color:'+(skip?'var(--on-surface-variant)':sc>=40?'var(--secondary)':sc>=20?'var(--tertiary)':'var(--on-surface-variant)')+'">'+(skip?'SKIP':sc!==null?sc.toFixed(1)+'%':'')+'</span>'
+    +'<span class="feed-time">'+ts+'</span>';
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight;
+}
+
 // ===== SCAN =====
 async function runScan(opts = {}) {
   if (isScanning) return showToast('Scan already in progress...');
   isScanning = true;
-
-  // Update buttons
   const btn = document.getElementById('btn-scan');
   const btnFast = document.getElementById('btn-scan-fast');
   btn.innerHTML = '<span class="material-symbols-outlined btn-icon spinning">progress_activity</span>SCANNING...';
   btn.disabled = true; btnFast.disabled = true; btnFast.style.opacity = '0.5';
-
-  // Open sidebar & reset
+  resetTerminal();
   document.getElementById('sidebar-logs').innerHTML = '';
   openSidebar();
   setStatus('scanning', opts.fast ? 'Fast Scan (no OI)...' : 'Scanning NSE...');
   startTimer();
-
-  // Start the scan (fire & forget — server returns 202 immediately)
   try {
-    const res = await fetch('/api/scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(opts),
-    });
-    if (res.status === 409) { showToast('Scan already running'); resetButtons(); return; }
+    const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(opts) });
+    if (res.status===409) { showToast('Scan already running'); resetButtons(); return; }
     if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
   } catch (e) {
-    setStatus('error', 'Failed to start scan');
-    appendLog({ text: '❌ ' + e.message, type: 'stderr' });
-    stopTimer(); resetButtons(); return;
+    setStatus('error','Failed to start'); setTerminalBadge('error');
+    appendLog({text:'❌ '+e.message,type:'stderr'}); stopTimer(); resetButtons(); return;
   }
-
-  // Connect SSE for live logs
   if (evtSource) evtSource.close();
   evtSource = new EventSource('/api/scan/stream');
-
   evtSource.addEventListener('log', e => {
     const entry = JSON.parse(e.data);
     appendLog(entry);
+    addTerminalEntry(entry.text);
   });
-
   evtSource.addEventListener('status', e => {
-    const data = JSON.parse(e.data);
-    if (data.scanning) setStatus('scanning', 'Scanning...');
+    const d = JSON.parse(e.data);
+    if (d.scanning) setStatus('scanning','Scanning...');
   });
-
   evtSource.addEventListener('complete', async e => {
-    const data = JSON.parse(e.data);
-    evtSource.close(); evtSource = null;
-    stopTimer();
-
-    if (data.success) {
-      setStatus('done', `Complete — ${data.candidateCount} candidates`);
-      appendLog({ text: `\n✅ Found ${data.candidateCount} breakout candidates`, type: 'system' });
-      // Reload data
-      try {
-        const res = await fetch('/api/data');
-        DATA = await res.json();
-        expanded = null; currentPage = 1;
-        render();
-        showToast('✅ Scan complete — dashboard updated');
-      } catch {}
+    const d = JSON.parse(e.data);
+    evtSource.close(); evtSource=null; stopTimer();
+    if (d.success) {
+      setStatus('done','Complete — '+d.candidateCount+' candidates');
+      setTerminalBadge('done');
+      appendLog({text:'\n✅ Found '+d.candidateCount+' breakout candidates',type:'system'});
+      try { const r=await fetch('/api/data'); DATA=await r.json(); expanded=null; currentPage=1; render(); showToast('✅ Dashboard updated'); } catch{}
     } else {
-      setStatus('error', 'Scan failed');
-      appendLog({ text: '❌ ' + (data.error || 'Unknown error'), type: 'stderr' });
+      setStatus('error','Scan failed'); setTerminalBadge('error');
+      appendLog({text:'❌ '+(d.error||'Unknown error'),type:'stderr'});
     }
     resetButtons();
   });
-
   evtSource.onerror = () => {
-    setStatus('error', 'Connection lost');
-    evtSource.close(); evtSource = null;
-    stopTimer(); resetButtons();
+    setStatus('error','Connection lost'); setTerminalBadge('error');
+    evtSource.close(); evtSource=null; stopTimer(); resetButtons();
   };
 }
-
 function resetButtons() {
   isScanning = false;
-  const btn = document.getElementById('btn-scan');
-  const btnFast = document.getElementById('btn-scan-fast');
+  const btn = document.getElementById('btn-scan'), btnFast = document.getElementById('btn-scan-fast');
   btn.innerHTML = '<span class="material-symbols-outlined btn-icon">radar</span>RUN SCAN';
   btn.disabled = false; btnFast.disabled = false; btnFast.style.opacity = '1';
 }

@@ -101,8 +101,68 @@ input { font-family: 'JetBrains Mono', monospace; }
 /* ===== MAIN ===== */
 .app-main { padding: 88px var(--margin) 48px; max-width: var(--max-w); margin: 0 auto; }
 
+/* ===== CONTEXT ROW (market cards + terminal) ===== */
+.context-row { display: grid; grid-template-columns: 1fr 280px; gap: var(--gutter); margin-bottom: var(--gutter); align-items: start; }
+
 /* ===== MARKET CONTEXT ===== */
-.section-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--gutter); margin-bottom: var(--gutter); }
+.section-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--gutter); }
+
+/* ===== PROGRESS TERMINAL ===== */
+.terminal-panel {
+  display: flex; flex-direction: column; height: 100%; min-height: 200px; max-height: 340px;
+  overflow: hidden;
+}
+.terminal-panel:hover { background: var(--glass-bg); }
+.terminal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.06); flex-shrink: 0;
+}
+.terminal-title { display: flex; align-items: center; gap: 8px; }
+.terminal-title h3 { font-size: 14px; font-weight: 700; }
+.terminal-badge {
+  font-size: 9px; font-weight: 800; letter-spacing: 0.1em; padding: 3px 8px;
+  border-radius: 999px; text-transform: uppercase;
+}
+.terminal-badge.idle { background: rgba(255,255,255,0.06); color: var(--on-surface-variant); }
+.terminal-badge.live {
+  background: rgba(125,255,162,0.15); color: var(--secondary); border: 1px solid rgba(125,255,162,0.3);
+  animation: pulse-dot 1.5s ease infinite;
+}
+.terminal-badge.done { background: rgba(68,216,241,0.12); color: var(--primary); }
+.terminal-badge.error { background: rgba(255,180,171,0.12); color: var(--error); }
+.terminal-progress {
+  padding: 8px 16px; display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.04); flex-shrink: 0;
+}
+.progress-track { flex: 1; height: 4px; background: var(--surface-highest); border-radius: 999px; overflow: hidden; }
+.progress-fill {
+  height: 100%; background: linear-gradient(90deg, var(--primary), var(--secondary));
+  border-radius: 999px; transition: width 0.3s ease; width: 0%;
+  box-shadow: 0 0 8px rgba(68,216,241,0.3);
+}
+.progress-label { color: var(--on-surface-variant); white-space: nowrap; }
+.terminal-feed { flex: 1; overflow-y: auto; padding: 6px 0; }
+.terminal-empty {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; padding: 20px; text-align: center;
+}
+.feed-entry {
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 16px; font-size: 11px; animation: feed-in .2s ease;
+  transition: background .15s;
+}
+.feed-entry:hover { background: rgba(255,255,255,0.03); }
+@keyframes feed-in { from { opacity: 0; transform: translateY(-4px); } }
+.feed-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+}
+.feed-dot.high { background: var(--secondary); box-shadow: 0 0 6px rgba(125,255,162,0.5); }
+.feed-dot.mid { background: var(--tertiary); }
+.feed-dot.low { background: var(--on-surface-variant); }
+.feed-dot.skip { background: var(--error); opacity: 0.5; }
+.feed-symbol { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--on-surface); min-width: 80px; }
+.feed-score { font-family: 'JetBrains Mono', monospace; font-size: 10px; margin-left: auto; }
+.feed-time { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--on-surface-variant); min-width: 50px; }
 .context-card { padding: 20px; border-radius: var(--r-md); position: relative; overflow: hidden; }
 .context-card .card-label { margin-bottom: 6px; }
 .regime-card { display: flex; align-items: center; gap: 20px; }
@@ -416,6 +476,7 @@ tbody tr.expanded-parent { border-left: 2px solid var(--primary); background: rg
 
 /* ===== RESPONSIVE ===== */
 @media (max-width: 1024px) {
+  .context-row { grid-template-columns: 1fr; }
   .section-grid { grid-template-columns: 1fr; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .spotlight-grid { grid-template-columns: 1fr; }
