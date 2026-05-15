@@ -42,7 +42,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   try {
     const res = await fetch('/api/data');
     if(!res.ok) throw new Error('No previous scan data found');
-    DATA = await res.json();
+    const json = await res.json();
+    if(!json || !json.candidates) throw new Error('Invalid data format');
+    DATA = json;
     render();
   } catch(e) {
     document.querySelector('.loading-text').textContent = 'No data yet — click RUN SCAN to fetch live NSE data';
@@ -180,7 +182,11 @@ async function runScan(opts = {}) {
       setStatus('done','Complete — '+d.candidateCount+' candidates');
       setTerminalBadge('done');
       appendLog({text:'\n✅ Found '+d.candidateCount+' breakout candidates',type:'system'});
-      try { const r=await fetch('/api/data'); DATA=await r.json(); expanded=null; currentPage=1; render(); showToast('✅ Dashboard updated'); } catch{}
+      try {
+        const r=await fetch('/api/data'); const json=await r.json();
+        if(json && json.candidates) { DATA=json; expanded=null; currentPage=1; render(); showToast('✅ Dashboard updated'); }
+        else { showToast('⚠️ Scan finished but no candidates found'); }
+      } catch(err) { showToast('⚠️ Could not load results: '+err.message); }
     } else {
       setStatus('error','Scan failed'); setTerminalBadge('error');
       appendLog({text:'❌ '+(d.error||'Unknown error'),type:'stderr'});
@@ -207,7 +213,7 @@ function showToast(msg) {
 
 // ===== RENDER =====
 function render() {
-  if(!DATA) return;
+  if(!DATA || !DATA.candidates || !DATA.metadata) return;
   renderScanTime(); renderMarketContext(); renderSummaryStats(); renderSpotlight(); renderTable();
 }
 
