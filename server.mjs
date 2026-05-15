@@ -21,7 +21,12 @@ let sseClients = [];
 
 function broadcast(event, data) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach(res => { try { res.write(msg); } catch {} });
+  sseClients.forEach(res => {
+    try {
+      res.write(msg);
+      if (typeof res.flush === 'function') res.flush();
+    } catch {}
+  });
 }
 
 async function serveStatic(res, filePath) {
@@ -121,6 +126,8 @@ const server = createServer(async (req, res) => {
       'X-Accel-Buffering': 'no',
     });
     res.flushHeaders();
+    // Disable Nagle's algorithm for instant writes
+    if (res.socket) res.socket.setNoDelay(true);
 
     // Send all existing logs so late joiners see history
     scanLogs.forEach(entry => {
@@ -128,9 +135,16 @@ const server = createServer(async (req, res) => {
     });
     // Send current status
     res.write(`event: status\ndata: ${JSON.stringify({ scanning: scanProcess !== null })}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
 
     sseClients.push(res);
     req.on('close', () => { sseClients = sseClients.filter(c => c !== res); });
+
+    // Heartbeat to keep connection alive
+    const hb = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch { clearInterval(hb); }
+    }, 15000);
+    req.on('close', () => clearInterval(hb));
     return;
   }
 
